@@ -48,11 +48,11 @@ SERVICE_TYPES = {
     "Enchanter": "Рунный мастер", "Hairdresser": "Цирюльник", "Prostitute": "Бордель",
     "Whetstone": "Точильный камень", "ArmorRepairTable": "Верстак бронника",
     "AlchemyTable": "Алхимический стол", "Cammerlengo": "Банк", "GwentPlayer": "Игрок в гвинт",
-    "Boat": "Лодка", "Horse": "Лошадь", "Entrance": "Вход",
+    "Boat": "Лодка", "Horse": "Лошадь", "Entrance": "Вход", "Herb": "Трава",
 }
 
 # pins that never become "cleared" (signposts, stash, quest markers) - hidden from to-do lists
-PERMANENT_TYPES = {"RoadSign", "PlayerStash", "Harbor", "ChapterQuest", "StoryQuest", "SideQuest",
+PERMANENT_TYPES = {"RoadSign", "PlayerStash", "Harbor", "Herb", "ChapterQuest", "StoryQuest", "SideQuest",
                    "MonsterQuest", "TreasureQuest", "QuestGiverStory", "QuestGiverChapter", "QuestGiverSide"}
 
 _LOG_OVERRIDE: str | None = None
@@ -332,6 +332,37 @@ def load_state() -> tuple[dict | None, str | None]:
     return parse_dump(rows), None
 
 
+def guide_path() -> Path:
+    custom = os.environ.get("W3_AI_GUIDE")
+    if custom:
+        return Path(custom)
+    here = Path(__file__).resolve().parent
+    for cand in (here.parent / "AI_GUIDE.md", here / "AI_GUIDE.md"):
+        if cand.exists():
+            return cand
+    return here.parent / "AI_GUIDE.md"
+
+
+def read_guide(section: str = "") -> str:
+    path = guide_path()
+    if not path.exists():
+        return f"Файл руководства не найден: {path}"
+    text = path.read_text(encoding="utf-8")
+    if not section.strip():
+        return text
+    q = section.strip().lower()
+    blocks, cur = [], []
+    for line in text.splitlines():
+        if line.startswith("## ") and cur:
+            blocks.append("\n".join(cur))
+            cur = []
+        cur.append(line)
+    if cur:
+        blocks.append("\n".join(cur))
+    hits = [b for b in blocks if q in b.lower()]
+    return "\n\n".join(hits) if hits else f"Раздел «{section}» не найден. Вызовите без аргумента для всего файла."
+
+
 def log_status() -> str:
     path = log_path()
     if not path.exists():
@@ -373,6 +404,14 @@ def run_mcp() -> None:
         return map_markdown(filter_pins(state, type_filter, status, max(1, min(limit, 500))))
 
     @mcp.tool()
+    def get_guide(section: str = "") -> str:
+        """Руководство для ИИ-гида (AI_GUIDE.md): правила роли, технические заметки по дампу,
+        секреты и пропускаемый контент по регионам. СОДЕРЖИТ СПОЙЛЕРЫ — не пересказывать
+        игроку концовки квестов. section: слово из заголовка/текста раздела (например
+        'Белый Сад', 'Велен', 'Моды'); пусто = весь файл. Читать в начале разговора."""
+        return read_guide(section)
+
+    @mcp.tool()
     def witcher_log_status() -> str:
         """Диагностика: где лежит scriptslog.txt, его размер и есть ли в нём строки мода."""
         return log_status()
@@ -389,12 +428,18 @@ def main() -> None:
     mode.add_argument("--json", action="store_true", help="вывести состояние в JSON")
     mode.add_argument("--map", action="store_true", help="вывести точки карты (Markdown)")
     mode.add_argument("--status", action="store_true", help="диагностика лога")
+    mode.add_argument("--guide", nargs="?", const="", default=None, help="показать AI_GUIDE.md (или раздел)")
     ap.add_argument("--type", default="", help="фильтр типа точек для --map")
     ap.add_argument("--pins", default="todo", help="статус точек для --map: all|todo|hidden|open|done")
     ap.add_argument("--out", help="записать результат в файл вместо консоли")
     ap.add_argument("--log", help="путь к scriptslog.txt")
     args = ap.parse_args()
     _LOG_OVERRIDE = args.log
+
+    if args.guide is not None:
+        sys.stdout.reconfigure(encoding="utf-8")
+        print(read_guide(args.guide))
+        return
 
     if not (args.print or args.json or args.map or args.status):
         run_mcp()
