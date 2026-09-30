@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "witcher3": {
+      "command": "python",
+      "args": ["C:\\path\\to\\AIWitcher\\mcp_server\\witcher_mcp.py"]
+    }
+  }
+}
