@@ -328,6 +328,57 @@ ROUTE_WEIGHT = {"PlaceOfPower": 0.6, "TreasureHuntMappin": 0.8, "BossAndTreasure
                 "DungeonCrawl": 0.9, "RoadSign": 1.15}
 
 
+NEST_BOMB_IDS = ("grapeshot", "samum", "dancing star")
+TYPE_REQUIREMENTS = {
+    "MonsterNest": "нужна бомба: Картечь / Самум / Танцующая звезда (сначала перебить чудовищ)",
+    "BossAndTreasure": "охраняемое сокровище — сильный страж, проверить уровень (красный череп = уйти)",
+    "RescuingTown": "деревня занята бандитами/чудовищами — бой с группой",
+    "BanditCamp": "лагерь — бой с группой бандитов",
+    "BanditCampfire": "несколько бандитов у костра",
+    "DungeonCrawl": "подземелье/пещера — может быть темно и тесно, взять факел",
+    "SpoilsOfWar": "трофеи войны — часто под водой или с ключом рядом",
+    "PlaceOfPower": "без требований; даёт очко навыка при первой активации",
+    "RoadSign": "без требований; открывает быстрое перемещение",
+}
+
+
+def notes_path() -> Path:
+    custom = os.environ.get("W3_POI_NOTES")
+    if custom:
+        return Path(custom)
+    return Path(__file__).resolve().parent.parent / "poi_notes.json"
+
+
+def load_notes() -> dict:
+    p = notes_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return {}
+
+
+def save_note(tag: str, note: str = "", skip: bool | None = None) -> str:
+    data = load_notes()
+    entry = data.get(tag, {"note": "", "skip": False})
+    if note:
+        entry["note"] = note
+    if skip is not None:
+        entry["skip"] = bool(skip)
+    data[tag] = entry
+    notes_path().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return f"Заметка сохранена для {tag}: skip={entry['skip']}; {entry['note']}"
+
+
+def has_nest_bomb(s: dict) -> bool:
+    for it in s["inventory"]:
+        iid = str(it.get("id", "")).lower()
+        if any(b in iid for b in NEST_BOMB_IDS):
+            return True
+    return False
+
+
 def _player_xy(s: dict) -> tuple[float, float] | None:
     try:
         x, y = s["world"]["position"].split()[:2]
@@ -346,6 +397,9 @@ def plan_route_impl(s: dict, count: int = 5, types: str = "", include_signposts:
     if start is None:
         return {"error": "В дампе нет позиции игрока."}
     wanted = [t.strip().lower() for t in types.split(",") if t.strip()]
+    notes = load_notes()
+    bombs = has_nest_bomb(s)
+    skipped = []
     cands = []
     for p in s["map_pins"]:
         if p["disabled"] or p["type"] in ROUTE_SKIP or p["type"] in SERVICE_TYPES:
@@ -358,6 +412,13 @@ def plan_route_impl(s: dict, count: int = 5, types: str = "", include_signposts:
             continue
         xy = (float(p["x"]), float(p["y"]))
         if max_radius and _d(start, xy) > max_radius:
+            continue
+        n = notes.get(p["tag"], {})
+        if n.get("skip"):
+            skipped.append((p, "пропуск по заметке: " + n.get("note", "")))
+            continue
+        if p["type"] == "MonsterNest" and not bombs:
+            skipped.append((p, "нет бомбы для гнезда"))
             continue
         cands.append((p, xy))
     route, cur = [], start
@@ -382,7 +443,9 @@ def plan_route_impl(s: dict, count: int = 5, types: str = "", include_signposts:
     for p, xy in route:
         leg = _d(cur, xy)
         total += leg
-        stops.append({**p, "leg": round(leg), "cumulative": round(total)})
+        stops.append({**p, "leg": round(leg), "cumulative": round(total),
+                      "requirement": TYPE_REQUIREMENTS.get(p["type"], ""),
+                      "note": notes.get(p["tag"], {}).get("note", "")})
         cur = xy
     tags = ",".join(p["tag"] for p, _ in route)
     cmds = []
@@ -390,7 +453,10 @@ def plan_route_impl(s: dict, count: int = 5, types: str = "", include_signposts:
         cmds.append(f'aimark("{tags}")')
         fx, fy = route[0][1]
         cmds.append(f"aipin({round(fx)}, {round(fy)})")
-    return {"start": start, "stops": stops, "total": round(total), "commands": cmds}
+    near_skipped = sorted(skipped, key=lambda t: _d(start, (float(t[0]["x"]), float(t[0]["y"]))))[:5]
+    return {"start": start, "stops": stops, "total": round(total), "commands": cmds,
+            "has_nest_bomb": bombs,
+            "skipped": [{"tag": p["tag"], "type": p["type"], "reason": why} for p, why in near_skipped]}
 
 
 def route_markdown(r: dict) -> str:
@@ -404,6 +470,15 @@ def route_markdown(r: dict) -> str:
         name = f" «{p['name']}»" if p["name"] else ""
         out.append(f"{i}. {pin_label(p['type'])}{name} — +{p['leg']} м (итого {p['cumulative']} м), "
                    f"({p['x']}, {p['y']}), {pin_status(p)} [{p['tag']}]")
+        if p.get("requirement"):
+            out.append(f"   требования: {p['requirement']}")
+        if p.get("note"):
+            out.append(f"   заметка: {p['note']}")
+    if r.get("skipped"):
+        out += ["", "Пропущено рядом:"]
+        out += [f"- {pin_label(k['type'])} [{k['tag']}] — {k['reason']}" for k in r["skipped"]]
+    if not r.get("has_nest_bomb"):
+        out.append("Гнёзда исключены: нет бомбы (Картечь / Самум / Танцующая звезда) — сварить в алхимии.")
     out += ["", "Команды для консоли игры (отметить на карте и поставить метку на первую точку):"]
     out += [f"    {c}" for c in r["commands"]]
     out.append("Повторный aipin с теми же координатами убирает метку. Уровень врагов в точках "
@@ -508,6 +583,13 @@ def run_mcp() -> None:
             return err
         return route_markdown(plan_route_impl(state, max(1, min(count, 30)), types,
                                               include_signposts, max_radius))
+
+    @mcp.tool()
+    def set_poi_note(tag: str, note: str = "", skip: bool | None = None) -> str:
+        """Записать в базу poi_notes.json заметку о точке карты (что нужно: ключ, бомба, уровень,
+        где лежит ключ, что внутри) и/или пометить точку skip=True, чтобы plan_route её не предлагал
+        (skip=False — вернуть). tag — внутреннее имя точки из дампа/get_map_points."""
+        return save_note(tag, note, skip)
 
     @mcp.tool()
     def get_guide(section: str = "") -> str:
