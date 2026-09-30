@@ -320,6 +320,97 @@ def map_markdown(pins: list[dict]) -> str:
     return "\n".join([head] + [_pin_line(p) for p in pins])
 
 
+# ---------------------------------------------------------------- route planning
+ROUTE_SKIP = {"Enemy", "ChapterQuest", "StoryQuest", "SideQuest", "QuestAvailable", "MonsterQuest",
+              "TreasureQuest", "Herb", "PlayerStash", "Harbor", "Boat", "Teleport", "Entrance"}
+# lower weight = preferred (distance is multiplied by it)
+ROUTE_WEIGHT = {"PlaceOfPower": 0.6, "TreasureHuntMappin": 0.8, "BossAndTreasure": 0.9,
+                "DungeonCrawl": 0.9, "RoadSign": 1.15}
+
+
+def _player_xy(s: dict) -> tuple[float, float] | None:
+    try:
+        x, y = s["world"]["position"].split()[:2]
+        return float(x), float(y)
+    except (KeyError, ValueError):
+        return None
+
+
+def _d(a, b) -> float:
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+
+def plan_route_impl(s: dict, count: int = 5, types: str = "", include_signposts: bool = True,
+               max_radius: float = 0) -> dict:
+    start = _player_xy(s)
+    if start is None:
+        return {"error": "В дампе нет позиции игрока."}
+    wanted = [t.strip().lower() for t in types.split(",") if t.strip()]
+    cands = []
+    for p in s["map_pins"]:
+        if p["disabled"] or p["type"] in ROUTE_SKIP or p["type"] in SERVICE_TYPES:
+            continue
+        if p["tag"] in ("", "None"):
+            continue
+        if p["type"] == "RoadSign" and (not include_signposts or p["discovered"]):
+            continue
+        if wanted and not any(w in p["type"].lower() or w in pin_label(p["type"]).lower() for w in wanted):
+            continue
+        xy = (float(p["x"]), float(p["y"]))
+        if max_radius and _d(start, xy) > max_radius:
+            continue
+        cands.append((p, xy))
+    route, cur = [], start
+    while cands and len(route) < count:
+        i = min(range(len(cands)),
+                key=lambda k: _d(cur, cands[k][1]) * ROUTE_WEIGHT.get(cands[k][0]["type"], 1.0))
+        route.append(cands.pop(i))
+        cur = route[-1][1]
+    # 2-opt on the open path starting at the player
+    def length(r):
+        pts = [start] + [xy for _, xy in r]
+        return sum(_d(pts[k], pts[k + 1]) for k in range(len(pts) - 1))
+    improved = True
+    while improved and len(route) > 2:
+        improved = False
+        for a in range(len(route) - 1):
+            for b in range(a + 1, len(route)):
+                new = route[:a] + route[a:b + 1][::-1] + route[b + 1:]
+                if length(new) + 0.5 < length(route):
+                    route, improved = new, True
+    stops, cur, total = [], start, 0.0
+    for p, xy in route:
+        leg = _d(cur, xy)
+        total += leg
+        stops.append({**p, "leg": round(leg), "cumulative": round(total)})
+        cur = xy
+    tags = ",".join(p["tag"] for p, _ in route)
+    cmds = []
+    if route:
+        cmds.append(f'aimark("{tags}")')
+        fx, fy = route[0][1]
+        cmds.append(f"aipin({round(fx)}, {round(fy)})")
+    return {"start": start, "stops": stops, "total": round(total), "commands": cmds}
+
+
+def route_markdown(r: dict) -> str:
+    if "error" in r:
+        return r["error"]
+    if not r["stops"]:
+        return "Подходящих незачищенных точек не найдено."
+    out = [f"# Маршрут: {len(r['stops'])} точек, ~{r['total']} м от Геральта "
+           f"({round(r['start'][0])}, {round(r['start'][1])})", ""]
+    for i, p in enumerate(r["stops"], 1):
+        name = f" «{p['name']}»" if p["name"] else ""
+        out.append(f"{i}. {pin_label(p['type'])}{name} — +{p['leg']} м (итого {p['cumulative']} м), "
+                   f"({p['x']}, {p['y']}), {pin_status(p)} [{p['tag']}]")
+    out += ["", "Команды для консоли игры (отметить на карте и поставить метку на первую точку):"]
+    out += [f"    {c}" for c in r["commands"]]
+    out.append("Повторный aipin с теми же координатами убирает метку. Уровень врагов в точках "
+               "неизвестен — при красном черепе над противником пропускать точку.")
+    return "\n".join(out)
+
+
 def load_state() -> tuple[dict | None, str | None]:
     path = log_path()
     if not path.exists():
@@ -404,6 +495,21 @@ def run_mcp() -> None:
         return map_markdown(filter_pins(state, type_filter, status, max(1, min(limit, 500))))
 
     @mcp.tool()
+    def plan_route(count: int = 5, types: str = "", include_signposts: bool = True,
+                   max_radius: float = 0) -> str:
+        """Оптимальный маршрут по ближайшим незачищенным точкам карты от текущей позиции Геральта
+        (жадный ближайший сосед + 2-opt; места силы и сокровища в приоритете) и готовые команды
+        для консоли игры: aimark("теги") отмечает точки на карте, aipin(x, y) ставит путевую метку
+        на первую точку. count: число точек; types: фильтр типов через запятую (например
+        'PlaceOfPower,сокровище'); include_signposts: включать неоткрытые указатели;
+        max_radius: ограничение радиуса в метрах (0 = без ограничения)."""
+        state, err = load_state()
+        if err:
+            return err
+        return route_markdown(plan_route_impl(state, max(1, min(count, 30)), types,
+                                              include_signposts, max_radius))
+
+    @mcp.tool()
     def get_guide(section: str = "") -> str:
         """Руководство для ИИ-гида (AI_GUIDE.md): правила роли, технические заметки по дампу,
         секреты и пропускаемый контент по регионам. СОДЕРЖИТ СПОЙЛЕРЫ — не пересказывать
@@ -428,6 +534,7 @@ def main() -> None:
     mode.add_argument("--json", action="store_true", help="вывести состояние в JSON")
     mode.add_argument("--map", action="store_true", help="вывести точки карты (Markdown)")
     mode.add_argument("--status", action="store_true", help="диагностика лога")
+    mode.add_argument("--route", type=int, metavar="N", help="маршрут по N ближайшим точкам")
     mode.add_argument("--guide", nargs="?", const="", default=None, help="показать AI_GUIDE.md (или раздел)")
     ap.add_argument("--type", default="", help="фильтр типа точек для --map")
     ap.add_argument("--pins", default="todo", help="статус точек для --map: all|todo|hidden|open|done")
@@ -439,6 +546,12 @@ def main() -> None:
     if args.guide is not None:
         sys.stdout.reconfigure(encoding="utf-8")
         print(read_guide(args.guide))
+        return
+
+    if args.route:
+        state, err = load_state()
+        sys.stdout.reconfigure(encoding="utf-8")
+        print(err or route_markdown(plan_route_impl(state, args.route, args.type)))
         return
 
     if not (args.print or args.json or args.map or args.status):
